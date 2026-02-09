@@ -699,6 +699,45 @@ static bool isSafeSpanTwoParamConstruct(const CXXConstructExpr &Node,
   return isPtrBufferSafe(Arg0, Arg1, Ctx);
 }
 
+static bool isSafeStringViewTwoParamConstruct(const CXXConstructExpr &Node,
+                                              ASTContext &Ctx) {
+  const Expr *Arg0 = Node.getArg(0)->IgnoreParenImpCasts();
+  const Expr *Arg1 = Node.getArg(1)->IgnoreParenImpCasts();
+
+  // Pattern 1: String Literals (Safe if size <= length)
+  if (const auto *SL = dyn_cast<StringLiteral>(Arg0)) {
+    if (auto ArgSize = Arg1->getIntegerConstantExpr(Ctx)) {
+      if (ArgSize->getZExtValue() <= SL->getLength())
+        return true;
+    }
+  }
+
+  // Pattern 2: Constant Arrays (Safe if exact match)
+  QualType T0 = Arg0->getType().getCanonicalType();
+  if (const auto *CAT = Ctx.getAsConstantArrayType(T0)) {
+   if (auto ArgSize = Arg1->getIntegerConstantExpr(Ctx)) {
+     // Wrap CAT->getSize() in APSInt to match ArgSize's type
+     if (llvm::APSInt::compareValues(llvm::APSInt(CAT->getSize(), /*isUnsigned=*/true), 
+                                    *ArgSize) == 0)
+       return true;
+   }
+ }
+
+  // Pattern 3: Zero length is safe
+  if (auto Val = Arg1->getIntegerConstantExpr(Ctx)) {
+    if (Val->isZero()) return true;
+  }
+
+  // Pattern 4: Pointer/Iterator Pair
+  QualType T1 = Arg1->getType().getCanonicalType();
+  if ((T0->isPointerType() && T1->isPointerType()) ||
+      (T0->isRecordType() && T1->isRecordType())) {
+    return true;
+  }
+
+  return false;
+}
+
 static bool isSafeArraySubscript(const ArraySubscriptExpr &Node,
                                  const ASTContext &Ctx,
                                  const bool IgnoreStaticSizedArrays) {
@@ -1795,6 +1834,70 @@ public:
   DeclUseList getClaimedVarUseSites() const override {
     // If the constructor call is of the form `std::span{var, n}`, `var` is
     // considered an unsafe variable.
+    if (auto *DRE = dyn_cast<DeclRefExpr>(Ctor->getArg(0))) {
+      if (isa<VarDecl>(DRE->getDecl()))
+        return {DRE};
+    }
+    return {};
+  }
+
+  SmallVector<const Expr *, 1> getUnsafePtrs() const override { return {}; }
+};
+
+class StringViewTwoParamConstructorGadget : public WarningGadget {
+  static constexpr const char *const StringViewTwoParamConstructorTag =
+      "stringViewTwoParamConstructor";
+  const CXXConstructExpr *Ctor; // the string_view constructor expression
+
+public:
+  StringViewTwoParamConstructorGadget(const MatchResult &Result)
+      : WarningGadget(Kind::StringViewTwoParamConstructor),
+        Ctor(Result.getNodeAs<CXXConstructExpr>(
+            StringViewTwoParamConstructorTag)) {}
+
+  static bool classof(const Gadget *G) {
+    return G->getKind() == Kind::StringViewTwoParamConstructor;
+  }
+
+  static bool matches(const Stmt *S, ASTContext &Ctx, MatchResult &Result) {
+    const auto *CE = dyn_cast<CXXConstructExpr>(S);
+    if (!CE)
+      return false;
+    const auto *CDecl = CE->getConstructor();
+    const auto *CRecordDecl = CDecl->getParent();
+
+    // MATCH: std::basic_string_view
+    bool IsStringView =
+        CRecordDecl->isInStdNamespace() &&
+        CDecl->getDeclName().getAsString() == "basic_string_view" &&
+        CE->getNumArgs() == 2;
+
+    if (!IsStringView || isSafeStringViewTwoParamConstruct(*CE, Ctx))
+      return false;
+
+    Result.addNode(StringViewTwoParamConstructorTag, DynTypedNode::create(*CE));
+    return true;
+  }
+
+  static bool matches(const Stmt *S, ASTContext &Ctx,
+                      const UnsafeBufferUsageHandler *Handler,
+                      MatchResult &Result) {
+    if (ignoreUnsafeBufferInContainer(*S, Handler))
+      return false;
+    return matches(S, Ctx, Result);
+  }
+
+  void handleUnsafeOperation(UnsafeBufferUsageHandler &Handler,
+                             bool IsRelatedToDecl,
+                             ASTContext &Ctx) const override {
+    Handler.handleUnsafeOperationInStringView(Ctor, IsRelatedToDecl, Ctx);
+  }
+
+  SourceLocation getSourceLoc() const override { return Ctor->getBeginLoc(); }
+
+  DeclUseList getClaimedVarUseSites() const override {
+    // If the constructor call is of the form `std::string_view{var, n}`, `var`
+    // is considered an unsafe variable.
     if (auto *DRE = dyn_cast<DeclRefExpr>(Ctor->getArg(0))) {
       if (isa<VarDecl>(DRE->getDecl()))
         return {DRE};
@@ -2954,6 +3057,8 @@ std::set<const Expr *> clang::findUnsafePointers(const FunctionDecl *FD) {
                               const Expr *UnsafeArg = nullptr) override {}
     void handleUnsafeOperationInContainer(const Stmt *, bool,
                                           ASTContext &) override {}
+    void handleUnsafeOperationInStringView(const Stmt *, bool,
+                                           ASTContext &) override {}
     void handleUnsafeVariableGroup(const VarDecl *,
                                    const VariableGroupsManager &, FixItList &&,
                                    const Decl *,
